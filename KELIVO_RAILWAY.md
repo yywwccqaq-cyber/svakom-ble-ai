@@ -50,16 +50,21 @@ https://你的域名/health
 }
 ```
 
-连接成功后会显示四个工具：
+连接成功后会显示七个工具：
 
 - `toy_status`
+- `toy_ble_status`（只读显示能力与 FFE2/AE02 最近通知）
 - `toy_set_speed`
 - `toy_set_pattern`
+- `toy_set_stretch`（SL278K 伸缩模式 1–7）
+- `toy_set_suction`（SL278K 吸吮模式 1–5）
 - `toy_stop`
 
-在 SL278K 上，`toy_set_speed` 控制 1 档振动的强度，`toy_set_pattern` 控制振动花样，`toy_stop` 会向振动、伸缩、吸吮等已知通道都发送归零帧。当前版本不会通过通用“强度”工具意外启动伸缩或吸吮通道。
+在 SL278K 上，`toy_set_speed` 控制 1 档振动的强度，`toy_set_pattern` 控制振动花样，`toy_set_stretch` 和 `toy_set_suction` 分别使用已验证范围内的伸缩、吸吮模式。`toy_stop` 会向振动、伸缩、吸吮等已知通道都发送归零帧。通用“强度”工具不会意外启动伸缩或吸吮通道。
 
-建议先在 Kelivo 中把 `toy_set_speed` 和 `toy_set_pattern` 标记为“需要批准”。`toy_stop` 不建议增加批准步骤，以便随时停止。
+建议在 Kelivo 中把 `toy_set_speed`、`toy_set_pattern`、`toy_set_stretch` 和 `toy_set_suction` 全部标记为“需要批准”。`toy_status`、`toy_ble_status` 是只读工具；`toy_stop` 不建议增加批准步骤，以便随时停止。
+
+没有暴露任意十六进制写入。SL278K 的 `AE01` 在现有技术记录中没有产生控制响应；加热帧的通道索引和温控语义也尚未通过实机验证，因此这两项不会作为 MCP 写入工具出现。
 
 ## 3. 在设备附近启动电脑蓝牙中继
 
@@ -111,6 +116,8 @@ SL278K 会广播 `0000e0ff-...`，连接后提供 `FFE0/FFE1/FFE2` 和 `AE00/AE0
 🎉 就绪！等待指令中（SL278K）...
 ```
 
+新版中继还会订阅 `FFE2` 和 `AE02`，并通过 `toy_ble_status` 返回最近通知的十六进制值及距今秒数。该工具只读，不会向设备写入内容。
+
 ## 4. 安全行为
 
 - 所有动作都有有限时长，默认 30 秒，服务端最大值默认 300 秒。
@@ -122,6 +129,18 @@ SL278K 会广播 `0000e0ff-...`，连接后提供 `FFE0/FFE1/FFE2` 和 `AE00/AE0
 - `BRIDGE_SECRET` 只放 Railway Variables、Kelivo 请求头和电脑临时环境变量；不要写进仓库、URL、截图或日志。
 
 首次动作测试必须让设备保持未佩戴/未使用状态，先用 10% 强度和 3 秒时长验证，并确保能立即使用实体按键停止。
+
+新增动作也必须逐项测试，不要同时启动多个通道：
+
+```text
+请只调用 toy_set_stretch：模式 1、强度 10%、持续 3 秒。
+```
+
+```text
+请只调用 toy_set_suction：模式 1、强度 10%、持续 3 秒。
+```
+
+每项测试结束后调用 `toy_stop`，确认完全停止再测试下一项。
 
 ## 5. 常见问题
 
