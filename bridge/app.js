@@ -9,6 +9,7 @@ const DEFAULT_DURATION_SECONDS = 30;
 const DEFAULT_MAX_DURATION_SECONDS = 300;
 const DEFAULT_COMMAND_TTL_MS = 5_000;
 const DEFAULT_BRIDGE_ONLINE_WINDOW_MS = 4_000;
+const KNOWN_CAPABILITIES = new Set(["vibration", "stretch", "suction"]);
 
 function boundedInteger(value, fallback, minimum, maximum) {
   const parsed = Number.parseInt(String(value ?? ""), 10);
@@ -37,6 +38,38 @@ function textResult(message, data = {}, isError = false) {
   };
 }
 
+function commandKind(command) {
+  if (command.stop) return "stop";
+  if (command.action) return command.action;
+  if (command.pattern) return "vibration_pattern";
+  return "vibration";
+}
+
+function parseCapabilities(value) {
+  return [...new Set(String(value ?? "")
+    .split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter((item) => KNOWN_CAPABILITIES.has(item)))];
+}
+
+function safeProfile(value) {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  return ["sl278h", "sl278k"].includes(normalized) ? normalized : null;
+}
+
+function safeHex(value) {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  return /^[0-9a-f]{2,128}$/.test(normalized) && normalized.length % 2 === 0
+    ? normalized
+    : null;
+}
+
+function boundedAgeMs(value) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  if (!Number.isFinite(parsed) || parsed < 0) return null;
+  return Math.min(parsed, 86_400_000);
+}
+
 export class RelayState {
   constructor({
     now = () => Date.now(),
@@ -48,14 +81,33 @@ export class RelayState {
     this.bridgeOnlineWindowMs = bridgeOnlineWindowMs;
     this.lastBridgeSeenAt = null;
     this.bridgeReady = false;
+    this.bridgeProfile = null;
+    this.bridgeCapabilities = [];
+    this.bleNotifications = { ffe2: null, ae02: null };
     this.pending = null;
     this.lastDelivered = null;
     this.activeEstimate = null;
   }
 
-  touchBridge(ready) {
+  touchBridge(ready, { profile, capabilities = [], notifications = {} } = {}) {
     this.lastBridgeSeenAt = this.now();
     this.bridgeReady = Boolean(ready);
+    this.bridgeProfile = this.bridgeReady ? safeProfile(profile) : null;
+    this.bridgeCapabilities = this.bridgeReady
+      ? capabilities.filter((item) => KNOWN_CAPABILITIES.has(item))
+      : [];
+    if (this.bridgeReady) {
+      for (const channel of ["ffe2", "ae02"]) {
+        const hex = safeHex(notifications[channel]?.hex);
+        const ageMs = boundedAgeMs(notifications[channel]?.ageMs);
+        if (hex && ageMs !== null) {
+          this.bleNotifications[channel] = {
+            hex,
+            observedAt: this.now() - ageMs,
+          };
+        }
+      }
+    }
     if (!this.bridgeReady) {
       if (this.pending && !this.pending.command.stop) this.pending = null;
       this.activeEstimate = null;
@@ -71,6 +123,10 @@ export class RelayState {
 
   isDeviceReady() {
     return this.isBridgeAlive() && this.bridgeReady;
+  }
+
+  supports(capability) {
+    return this.isDeviceReady() && this.bridgeCapabilities.includes(capability);
   }
 
   prune() {
@@ -135,22 +191,34 @@ export class RelayState {
       pending_command: this.pending
         ? {
             id: this.pending.id,
-            kind: this.pending.command.stop
-              ? "stop"
-              : this.pending.command.pattern
-                ? "pattern"
-                : "speed",
+            kind: commandKind(this.pending.command),
           }
         : null,
       active_estimate: this.activeEstimate
         ? {
-            kind: this.activeEstimate.command.pattern ? "pattern" : "speed",
+            kind: commandKind(this.activeEstimate.command),
             remaining_seconds: Math.max(
               0,
               Math.ceil((this.activeEstimate.until - now) / 1_000),
             ),
           }
         : null,
+      device_profile: deviceReady ? this.bridgeProfile : null,
+      capabilities: deviceReady ? [...this.bridgeCapabilities] : [],
+      ble_notifications: Object.fromEntries(
+        Object.entries(this.bleNotifications).map(([channel, entry]) => [
+          channel,
+          entry
+            ? {
+                hex: entry.hex,
+                age_seconds: Math.max(
+                  0,
+                  Math.round((now - entry.observedAt) / 1_000),
+                ),
+              }
+            : null,
+        ]),
+      ),
     };
   }
 }
@@ -158,7 +226,7 @@ export class RelayState {
 function createToyMcpServer(state, { maxDurationSeconds }) {
   const server = new McpServer({
     name: "svakom-kelivo-bridge",
-    version: "1.0.0",
+    version: "1.1.0",
   });
 
   const requireReady = () => {
@@ -170,12 +238,23 @@ function createToyMcpServer(state, { maxDurationSeconds }) {
     );
   };
 
+  const requireCapability = (capability, label) => {
+    const notReady = requireReady();
+    if (notReady) return notReady;
+    if (state.supports(capability)) return null;
+    return textResult(
+      `当前蓝牙设备没有报告“${label}”能力，未发送动作。`,
+      state.snapshot(),
+      true,
+    );
+  };
+
   server.registerTool(
     "toy_set_speed",
     {
       title: "设置设备强度",
       description:
-        "仅在用户明确要求控制设备时调用。把强度设置为 0 到 1，并在有限时长后自动停止；0 表示立即停止。",
+        "仅在用户明确要求控制设备时调用。在 SL278K 上控制振动模式 1 的强度，并在有限时长后自动停止；0 表示立即停止。",
       inputSchema: {
         speed: z
           .number()
@@ -260,6 +339,98 @@ function createToyMcpServer(state, { maxDurationSeconds }) {
   );
 
   server.registerTool(
+    "toy_set_stretch",
+    {
+      title: "设置伸缩模式",
+      description:
+        "仅在用户明确要求伸缩动作时调用。设置 SL278K 的 1 到 7 档伸缩模式和有限时长；不会启动吸吮或加热。",
+      inputSchema: {
+        mode: z.number().int().min(1).max(7).describe("伸缩模式，1 到 7"),
+        strength: z
+          .number()
+          .min(0.1)
+          .max(1)
+          .default(0.3)
+          .describe("伸缩强度，0.1 到 1；首次建议 0.1"),
+        duration_seconds: z
+          .number()
+          .int()
+          .min(1)
+          .max(maxDurationSeconds)
+          .default(DEFAULT_DURATION_SECONDS)
+          .describe(`运行秒数，最长 ${maxDurationSeconds} 秒`),
+      },
+    },
+    async ({ mode, strength, duration_seconds }) => {
+      const unavailable = requireCapability("stretch", "伸缩");
+      if (unavailable) return unavailable;
+      const entry = state.enqueue({
+        action: "stretch",
+        mode,
+        level: strength,
+        sec: duration_seconds,
+      });
+      return textResult(
+        `已排队：伸缩模式 ${mode}，强度 ${Math.round(strength * 100)}%，运行 ${duration_seconds} 秒后自动停止。`,
+        {
+          queued: true,
+          command_id: entry.id,
+          action: "stretch",
+          mode,
+          strength,
+          duration_seconds,
+        },
+      );
+    },
+  );
+
+  server.registerTool(
+    "toy_set_suction",
+    {
+      title: "设置吸吮模式",
+      description:
+        "仅在用户明确要求吸吮动作时调用。设置 SL278K 的 1 到 5 档吸吮模式和有限时长；不会启动伸缩或加热。",
+      inputSchema: {
+        mode: z.number().int().min(1).max(5).describe("吸吮模式，1 到 5"),
+        strength: z
+          .number()
+          .min(0.1)
+          .max(1)
+          .default(0.3)
+          .describe("吸吮强度，0.1 到 1；首次建议 0.1"),
+        duration_seconds: z
+          .number()
+          .int()
+          .min(1)
+          .max(maxDurationSeconds)
+          .default(DEFAULT_DURATION_SECONDS)
+          .describe(`运行秒数，最长 ${maxDurationSeconds} 秒`),
+      },
+    },
+    async ({ mode, strength, duration_seconds }) => {
+      const unavailable = requireCapability("suction", "吸吮");
+      if (unavailable) return unavailable;
+      const entry = state.enqueue({
+        action: "suction",
+        mode,
+        level: strength,
+        sec: duration_seconds,
+      });
+      return textResult(
+        `已排队：吸吮模式 ${mode}，强度 ${Math.round(strength * 100)}%，运行 ${duration_seconds} 秒后自动停止。`,
+        {
+          queued: true,
+          command_id: entry.id,
+          action: "suction",
+          mode,
+          strength,
+          duration_seconds,
+        },
+      );
+    },
+  );
+
+  server.registerTool(
     "toy_stop",
     {
       title: "立即停止设备",
@@ -300,6 +471,26 @@ function createToyMcpServer(state, { maxDurationSeconds }) {
           ? "电脑中继在线，但蓝牙设备尚未就绪。"
           : "蓝牙中继离线。";
       return textResult(message, status);
+    },
+  );
+
+  server.registerTool(
+    "toy_ble_status",
+    {
+      title: "查看 BLE 特征状态",
+      description:
+        "只读查看设备型号、已启用能力，以及 FFE2/AE02 最近一次通知；不会写入任何 BLE 特征。",
+      inputSchema: {},
+    },
+    async () => {
+      const status = state.snapshot();
+      return textResult(
+        status.device_ready
+          ? "已读取 BLE 能力与通知状态。"
+          : "蓝牙设备未就绪；返回最近可用的只读状态。",
+        status,
+        !status.device_ready,
+      );
     },
   );
 
@@ -346,7 +537,20 @@ export function createRelayApp({
 
   app.get("/toy-next", requireBridgeAuth, (request, response) => {
     const ready = request.get("x-bridge-ready") === "1";
-    state.touchBridge(ready);
+    state.touchBridge(ready, {
+      profile: request.get("x-bridge-profile"),
+      capabilities: parseCapabilities(request.get("x-bridge-capabilities")),
+      notifications: {
+        ffe2: {
+          hex: request.get("x-bridge-ffe2"),
+          ageMs: request.get("x-bridge-ffe2-age-ms"),
+        },
+        ae02: {
+          hex: request.get("x-bridge-ae02"),
+          ageMs: request.get("x-bridge-ae02-age-ms"),
+        },
+      },
+    });
     response.set("Cache-Control", "no-store");
     const command = state.takePending();
     response.json(
