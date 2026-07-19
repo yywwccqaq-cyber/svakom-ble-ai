@@ -1,0 +1,19 @@
+{
+  "name": "svakom-ble-ai-kelivo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Kelivo-compatible MCP relay for the SVAKOM BLE bridge",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node bridge/index.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "express": "5.2.1",
+    "zod": "4.4.3"
+  }
+}
