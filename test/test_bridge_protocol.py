@@ -45,6 +45,46 @@ class ProtocolTests(unittest.TestCase):
         )
         self.assertEqual(frames, (bytes.fromhex("55 03 00 00 08 06 00"),))
 
+    def test_sl278k_stretch_uses_opcode_08_and_seven_modes(self):
+        frames = bridge.action_frames(
+            {"action": "stretch", "mode": 7, "level": 0.2},
+            bridge.PROFILE_SL278K,
+        )
+        self.assertEqual(frames, (bytes.fromhex("55 08 00 00 07 02 00"),))
+
+    def test_sl278k_suction_uses_opcode_09_and_five_modes(self):
+        frames = bridge.action_frames(
+            {"action": "suction", "mode": 5, "level": 0.3},
+            bridge.PROFILE_SL278K,
+        )
+        self.assertEqual(frames, (bytes.fromhex("55 09 00 00 05 03 00"),))
+
+    def test_non_k_profile_rejects_stretch_and_suction(self):
+        self.assertEqual(
+            bridge.action_frames(
+                {"action": "stretch", "mode": 1, "level": 0.1},
+                bridge.PROFILE_SL278H,
+            ),
+            (),
+        )
+        self.assertEqual(
+            bridge.action_frames(
+                {"action": "suction", "mode": 1, "level": 0.1},
+                bridge.PROFILE_SL278H,
+            ),
+            (),
+        )
+
+    def test_profile_capabilities_are_bounded(self):
+        self.assertEqual(
+            bridge.profile_capabilities(bridge.PROFILE_SL278K),
+            ("vibration", "stretch", "suction"),
+        )
+        self.assertEqual(
+            bridge.profile_capabilities(bridge.PROFILE_SL278H),
+            ("vibration",),
+        )
+
     def test_sl278k_stop_covers_all_known_actuators(self):
         self.assertEqual(
             bridge.stop_frames(bridge.PROFILE_SL278K),
