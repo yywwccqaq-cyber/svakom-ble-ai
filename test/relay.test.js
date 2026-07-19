@@ -63,7 +63,15 @@ test("Kelivo-style Streamable HTTP client lists all tools", async () => {
   const result = await client.listTools();
   assert.deepEqual(
     result.tools.map((tool) => tool.name).sort(),
-    ["toy_set_pattern", "toy_set_speed", "toy_status", "toy_stop"],
+    [
+      "toy_ble_status",
+      "toy_set_pattern",
+      "toy_set_speed",
+      "toy_set_stretch",
+      "toy_set_suction",
+      "toy_status",
+      "toy_stop",
+    ],
   );
 });
 
@@ -100,6 +108,69 @@ test("ready bridge receives a finite-duration command exactly once", async () =>
 
   const secondPoll = await fetch(`${baseUrl}/toy-next`, { headers: pollHeaders });
   assert.equal((await secondPoll.json()).type, "hello");
+});
+
+test("actuator-specific tools reject a bridge that did not report capabilities", async () => {
+  const result = await client.callTool({
+    name: "toy_set_stretch",
+    arguments: { mode: 1, strength: 0.1, duration_seconds: 3 },
+  });
+  assert.equal(result.isError, true);
+});
+
+test("SL278K capabilities enable bounded stretch, suction, and BLE status", async () => {
+  const sl278kHeaders = {
+    "x-bridge-secret": SECRET,
+    "x-bridge-ready": "1",
+    "x-bridge-profile": "sl278k",
+    "x-bridge-capabilities": "vibration,stretch,suction,unknown",
+    "x-bridge-ffe2": "55aa",
+    "x-bridge-ffe2-age-ms": "120",
+    "x-bridge-ae02": "0102",
+    "x-bridge-ae02-age-ms": "250",
+  };
+
+  await fetch(`${baseUrl}/toy-next`, { headers: sl278kHeaders });
+
+  const stretchCall = await client.callTool({
+    name: "toy_set_stretch",
+    arguments: { mode: 2, strength: 0.1, duration_seconds: 3 },
+  });
+  assert.notEqual(stretchCall.isError, true);
+  const stretch = await (
+    await fetch(`${baseUrl}/toy-next`, { headers: sl278kHeaders })
+  ).json();
+  assert.equal(stretch.action, "stretch");
+  assert.equal(stretch.mode, 2);
+  assert.equal(stretch.level, 0.1);
+  assert.equal(stretch.sec, 3);
+
+  const suctionCall = await client.callTool({
+    name: "toy_set_suction",
+    arguments: { mode: 1, strength: 0.1, duration_seconds: 3 },
+  });
+  assert.notEqual(suctionCall.isError, true);
+  const suction = await (
+    await fetch(`${baseUrl}/toy-next`, { headers: sl278kHeaders })
+  ).json();
+  assert.equal(suction.action, "suction");
+  assert.equal(suction.mode, 1);
+  assert.equal(suction.level, 0.1);
+  assert.equal(suction.sec, 3);
+
+  const status = await client.callTool({
+    name: "toy_ble_status",
+    arguments: {},
+  });
+  assert.notEqual(status.isError, true);
+  assert.equal(status.structuredContent.device_profile, "sl278k");
+  assert.deepEqual(status.structuredContent.capabilities, [
+    "vibration",
+    "stretch",
+    "suction",
+  ]);
+  assert.equal(status.structuredContent.ble_notifications.ffe2.hex, "55aa");
+  assert.equal(status.structuredContent.ble_notifications.ae02.hex, "0102");
 });
 
 test("a disconnect clears unsafe pending actions but retains stop", async () => {
