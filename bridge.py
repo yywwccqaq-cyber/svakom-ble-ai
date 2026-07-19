@@ -1,12 +1,12 @@
 """
-SL278H BLE 控制中继
+SL278H / SL278K BLE 安全控制中继
 
-在设备附近运行：从 Railway 安全轮询有限时长的指令，通过蓝牙发送给设备，
-并每 1.5 秒续命。蓝牙断开时会清空当前动作，避免重连后意外恢复。
+在设备附近运行：从 Railway 安全轮询有限时长的指令，通过蓝牙发送给设备。
+蓝牙断开、程序退出或指令到时都会清空当前动作，避免重连后恢复旧动作。
 
 Windows PowerShell:
   $env:BRIDGE_URL="https://your-service.up.railway.app"
-  $env:BRIDGE_SECRET="your-long-random-secret"
+  $env:BRIDGE_SECRET=Read-Host "Paste BRIDGE_SECRET"
   python bridge.py
 """
 
@@ -17,11 +17,28 @@ import time
 import requests
 from bleak import BleakClient, BleakScanner
 
+SERVICE_UUID = "0000ffe0-0000-1000-8000-00805f9b34fb"
+ALT_SERVICE_UUID = "0000ae00-0000-1000-8000-00805f9b34fb"
 WRITE_UUID = "0000ffe1-0000-1000-8000-00805f9b34fb"
 NOTIFY_UUID = "0000ffe2-0000-1000-8000-00805f9b34fb"
+
+PROFILE_SL278H = "sl278h"
+PROFILE_SL278K = "sl278k"
+
 H = 0x55
 KEEPALIVE_SEC = 1.5
 POLL_SEC = 0.3
+SCAN_TIMEOUT_SEC = 12.0
+CONNECT_TIMEOUT_SEC = 60.0
+
+# The official SL278K app sends this neutralizing initialization sequence about
+# 240 ms after connecting. It is required before normal control packets work.
+SL278K_INIT_FRAMES = (
+    bytes([H, 0x04, 0x00, 0x00, 0x01, 0xFF, 0xAA]),
+    bytes([H, 0x04, 0x00, 0x00, 0x00, 0x00, 0xAA]),
+    bytes([H, 0x04, 0x00, 0x00, 0x00, 0x00, 0xAA]),
+    bytes([H, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00]),
+)
 
 BRIDGE_URL = os.environ.get("BRIDGE_URL", "").rstrip("/")
 BRIDGE_SECRET = os.environ.get("BRIDGE_SECRET", "")
@@ -32,26 +49,47 @@ MAX_DURATION_SEC = max(
     DEFAULT_DURATION_SEC, float(os.environ.get("MAX_DURATION_SECONDS", "300"))
 )
 
-current_cmd = None
+current_frames = None
 current_until = 0.0
 client_ref = None
+device_profile = None
 
 
 def log(message):
     print(message, flush=True)
 
 
+def detect_profile(device_name):
+    normalized = str(device_name or "").upper()
+    return PROFILE_SL278K if "SL278K" in normalized else PROFILE_SL278H
+
+
 def cmd_scale(value):
-    value = max(0, min(255, value))
-    return bytes([H, 4, 0, 0, 1, value, 0xAA])
+    value = max(0, min(255, int(value)))
+    return bytes([H, 0x04, 0x00, 0x00, 0x01, value, 0xAA])
 
 
 def cmd_scale_stop():
-    return bytes([H, 4, 0, 0, 0, 0, 0xAA])
+    return bytes([H, 0x04, 0x00, 0x00, 0x00, 0x00, 0xAA])
 
 
-def cmd_vibrate(mode, level):
-    return bytes([H, 3, 0, 0, max(1, min(8, mode)), max(1, min(5, level)), 0])
+def cmd_mode(opcode, mode, strength, *, max_mode, max_strength):
+    mode = max(1, min(max_mode, int(mode)))
+    strength = max(1, min(max_strength, int(strength)))
+    return bytes([H, opcode, 0x00, 0x00, mode, strength, 0x00])
+
+
+def cmd_mode_stop(opcode):
+    return bytes([H, opcode, 0x00, 0x00, 0x00, 0x00, 0x00])
+
+
+def stop_frames(profile):
+    # Send every relevant neutral frame. Unsupported opcodes are ignored by the
+    # device, while this makes stop robust across SL278H and SL278K actuators.
+    frames = [cmd_scale_stop(), cmd_mode_stop(0x03)]
+    if profile == PROFILE_SL278K:
+        frames.extend((cmd_mode_stop(0x08), cmd_mode_stop(0x09)))
+    return tuple(frames)
 
 
 def parse_duration(command):
@@ -71,62 +109,125 @@ def command_value(command):
     return None
 
 
-async def write(payload):
-    global client_ref
-    if client_ref and client_ref.is_connected:
-        try:
-            await client_ref.write_gatt_char(WRITE_UUID, payload, response=False)
-        except Exception as error:
-            log(f"写入失败: {error}")
-
-
-async def exec_cmd(command):
-    global current_cmd, current_until
-    if command.get("stop"):
-        current_cmd = None
-        current_until = 0
-        await write(cmd_scale_stop())
-        log("⏹ 停止")
-        return
-
+def action_frames(command, profile):
     if "pattern" in command:
-        mode = int(command["pattern"])
-        level = max(1, round(float(command.get("level", 0.6)) * 5))
-        current_cmd = cmd_vibrate(mode, level)
-        current_until = parse_duration(command)
-        await write(current_cmd)
-        log(f"🌀 花样 {mode} 档")
-        return
+        max_mode = 10 if profile == PROFILE_SL278K else 8
+        max_strength = 10 if profile == PROFILE_SL278K else 5
+        strength = round(float(command.get("level", 0.6)) * max_strength)
+        return (
+            cmd_mode(
+                0x03,
+                command["pattern"],
+                strength,
+                max_mode=max_mode,
+                max_strength=max_strength,
+            ),
+        )
 
     value = command_value(command)
     if value is None:
-        return
-    value = float(value)
+        return ()
+    value = max(0.0, min(1.0, float(value)))
     if value <= 0:
-        current_cmd = None
+        return stop_frames(profile)
+    if profile == PROFILE_SL278K:
+        # For the K profile, the existing generic speed tool controls vibration
+        # mode 1 at a 1..10 strength. Stretch/suction are intentionally not
+        # activated by this generic command.
+        return (
+            cmd_mode(
+                0x03,
+                1,
+                round(value * 10),
+                max_mode=10,
+                max_strength=10,
+            ),
+        )
+    return (cmd_scale(int(value * 255)),)
+
+
+async def write_frame(payload, *, client=None):
+    target = client or client_ref
+    if not target or not target.is_connected:
+        return False
+    try:
+        await target.write_gatt_char(WRITE_UUID, payload, response=False)
+        return True
+    except Exception as error:
+        log(f"写入失败: {error}")
+        return False
+
+
+async def write_frames(frames, *, client=None, pause=0.04):
+    wrote_all = True
+    for index, payload in enumerate(frames):
+        wrote_all = (await write_frame(payload, client=client)) and wrote_all
+        if pause and index + 1 < len(frames):
+            await asyncio.sleep(pause)
+    return wrote_all
+
+
+async def initialize_sl278k(client):
+    # Notifications are enabled first so acknowledgements are not missed.
+    try:
+        await client.start_notify(NOTIFY_UUID, lambda _sender, _data: None)
+    except Exception as error:
+        log(f"⚠️ 通知启用失败，将继续尝试握手: {error}")
+    await asyncio.sleep(0.24)
+    if not await write_frames(SL278K_INIT_FRAMES, client=client, pause=0.04):
+        raise RuntimeError("SL278K 初始化握手写入失败")
+    # End initialization in an explicitly neutral state.
+    await write_frames(stop_frames(PROFILE_SL278K), client=client, pause=0.02)
+
+
+async def exec_cmd(command):
+    global current_frames, current_until
+    profile = device_profile or PROFILE_SL278H
+    if command.get("stop"):
+        current_frames = None
         current_until = 0
-        await write(cmd_scale_stop())
+        await write_frames(stop_frames(profile))
+        log("⏹ 已发送全功能停止")
+        return
+
+    frames = action_frames(command, profile)
+    if not frames:
+        return
+    if command_value(command) is not None and float(command_value(command)) <= 0:
+        current_frames = None
+        current_until = 0
+        await write_frames(frames)
         log("⏹ 强度 0")
         return
 
-    current_cmd = cmd_scale(int(value * 255))
+    if not await write_frames(frames):
+        current_frames = None
+        current_until = 0
+        log("⚠️ 动作写入失败，未保持该动作")
+        return
+    current_frames = frames
     current_until = parse_duration(command)
-    await write(current_cmd)
-    log(f"📳 强度 {round(value * 100)}%")
+    if "pattern" in command:
+        log(
+            f"🌀 振动花样 {int(command['pattern'])}，强度 "
+            f"{round(float(command.get('level', 0.6)) * 100)}%"
+        )
+    else:
+        log(f"📳 振动强度 {round(float(command_value(command)) * 100)}%")
 
 
 async def keepalive_loop():
-    global current_cmd, current_until
+    global current_frames, current_until
     while True:
         await asyncio.sleep(KEEPALIVE_SEC)
         if current_until and time.monotonic() >= current_until:
-            current_cmd = None
+            current_frames = None
             current_until = 0
-            await write(cmd_scale_stop())
+            await write_frames(stop_frames(device_profile or PROFILE_SL278H))
             log("⏱ 到时自动停")
             continue
-        if current_cmd is not None:
-            await write(current_cmd)
+        if current_frames is not None:
+            await write_frames(current_frames)
 
 
 async def bridge_loop():
@@ -138,14 +239,17 @@ async def bridge_loop():
         return
 
     while True:
-        ready = bool(client_ref and client_ref.is_connected)
+        ready = bool(client_ref and client_ref.is_connected and device_profile)
         headers = {
             "x-bridge-secret": BRIDGE_SECRET,
             "x-bridge-ready": "1" if ready else "0",
         }
         try:
-            response = requests.get(
-                f"{BRIDGE_URL}/toy-next", headers=headers, timeout=4
+            response = await asyncio.to_thread(
+                requests.get,
+                f"{BRIDGE_URL}/toy-next",
+                headers=headers,
+                timeout=4,
             )
             if response.ok:
                 command = response.json()
@@ -157,37 +261,65 @@ async def bridge_loop():
         await asyncio.sleep(POLL_SEC)
 
 
+def client_options():
+    options = {
+        "timeout": CONNECT_TIMEOUT_SEC,
+        "services": [SERVICE_UUID, ALT_SERVICE_UUID],
+    }
+    if os.name == "nt":
+        options["winrt"] = {"use_cached_services": False}
+    return options
+
+
 async def ble_loop():
-    global client_ref, current_cmd, current_until
+    global client_ref, current_frames, current_until, device_profile
     while True:
-        log("🔍 扫描 SL278H ...")
-        devices = await BleakScanner.discover(timeout=6.0)
+        log("🔍 扫描 SL278H / SL278K ...")
+        devices = await BleakScanner.discover(timeout=SCAN_TIMEOUT_SEC)
         device = next(
-            (item for item in devices if item.name and "SL278" in item.name), None
+            (item for item in devices if item.name and "SL278" in item.name.upper()),
+            None,
         )
         if not device:
             log("⚠️ 没找到设备，5 秒后重试")
             await asyncio.sleep(5)
             continue
 
-        log(f"🔗 连接 {device.name} ...")
+        profile = detect_profile(device.name)
+        log(f"🔗 连接 {device.name}（{profile.upper()}）...")
         try:
-            async with BleakClient(device) as client:
+            async with BleakClient(device, **client_options()) as client:
+                if profile == PROFILE_SL278K:
+                    log("🔐 执行 SL278K 初始化握手...")
+                    await initialize_sl278k(client)
+                else:
+                    try:
+                        await client.start_notify(
+                            NOTIFY_UUID, lambda _sender, _data: None
+                        )
+                    except Exception:
+                        pass
+
                 client_ref = client
-                log("🎉 就绪！等待指令中...")
+                device_profile = profile
+                log(f"🎉 就绪！等待指令中（{device.name}）...")
                 try:
-                    await client.start_notify(NOTIFY_UUID, lambda _sender, _data: None)
-                except Exception:
-                    pass
-                while client.is_connected:
-                    await asyncio.sleep(1)
+                    while client.is_connected:
+                        await asyncio.sleep(1)
+                finally:
+                    # Best effort neutralization before a graceful local exit.
+                    if client.is_connected:
+                        await write_frames(stop_frames(profile), client=client)
+        except asyncio.CancelledError:
+            raise
         except Exception as error:
             log(f"断开: {error}")
         finally:
             # Never resume a previous action after a Bluetooth reconnect.
-            current_cmd = None
+            current_frames = None
             current_until = 0
             client_ref = None
+            device_profile = None
         await asyncio.sleep(2)
 
 
@@ -196,4 +328,7 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log("\n已退出。")
