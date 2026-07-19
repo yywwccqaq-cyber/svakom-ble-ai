@@ -1,22 +1,50 @@
-"""
-扫描设备的所有 GATT 服务和特征，用于确认控制通道。
-用法：python scan.py
-"""
+"""只读扫描 SL278H / SL278K 的 GATT 服务与特征。"""
+
 import asyncio
-from bleak import BleakScanner, BleakClient
+import os
+
+from bleak import BleakClient, BleakScanner
+
+SERVICE_UUID = "0000ffe0-0000-1000-8000-00805f9b34fb"
+ALT_SERVICE_UUID = "0000ae00-0000-1000-8000-00805f9b34fb"
+
+
+def client_options():
+    options = {
+        "timeout": 60.0,
+        "services": [SERVICE_UUID, ALT_SERVICE_UUID],
+    }
+    if os.name == "nt":
+        options["winrt"] = {"use_cached_services": False}
+    return options
+
 
 async def main():
-    print("🔍 扫描 SL278H ...")
-    devs = await BleakScanner.discover(timeout=6.0)
-    dev = next((d for d in devs if d.name and "SL278" in d.name), None)
-    if not dev:
-        print("⚠️ 没找到设备"); return
-    print(f"✅ 找到：{dev.name}  {dev.address}\n")
-    async with BleakClient(dev) as c:
-        for svc in c.services:
-            print(f"[服务] {svc.uuid}  {svc.description}")
-            for ch in svc.characteristics:
-                props = ",".join(ch.properties)
-                print(f"    [特征] {ch.uuid}  [{props}]  {ch.description}")
+    print("🔍 扫描 SL278H / SL278K ...")
+    devices = await BleakScanner.discover(timeout=12.0)
+    device = next(
+        (
+            item
+            for item in devices
+            if item.name and "SL278" in item.name.upper()
+        ),
+        None,
+    )
+    if not device:
+        print("⚠️ 没找到设备")
+        return
 
-asyncio.run(main())
+    print(f"✅ 找到：{device.name}\n")
+    async with BleakClient(device, **client_options()) as client:
+        for service in client.services:
+            print(f"[服务] {service.uuid}  {service.description}")
+            for characteristic in service.characteristics:
+                properties = ",".join(characteristic.properties)
+                print(
+                    f"    [特征] {characteristic.uuid}  "
+                    f"[{properties}]  {characteristic.description}"
+                )
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
