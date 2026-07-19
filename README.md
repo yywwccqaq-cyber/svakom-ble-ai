@@ -1,3 +1,5 @@
+> [!IMPORTANT]
+> **Kelivo + Railway 用户：** 本 fork 已补齐缺失的云端 MCP 服务、Railway 配置和安全版电脑蓝牙中继。请直接阅读 [Kelivo + Railway 部署说明](KELIVO_RAILWAY.md)。Kelivo 使用 Streamable HTTP 和 `Authorization` 请求头，**不要把长期密钥写进 URL**；下方 Claude.ai URL 示例仅是上游旧说明。
 # SVAKOM SL278H · BLE 逆向 + AI 远程控制完整教程
 
 > 从零逆向蓝牙协议，搭建 AI 远程控制系统。  
