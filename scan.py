@@ -18,7 +18,7 @@ SCAN_TIMEOUT_SECONDS = 12.0
 CONNECT_TIMEOUT_SECONDS = 60.0
 BASELINE_SECONDS = 5
 ACTION_OBSERVE_SECONDS = 12
-REPORT_PATH = Path("gatt_report.json")
+REPORT_PATH = Path(__file__).resolve().with_name("gatt_report.json")
 
 
 def client_options():
@@ -36,6 +36,13 @@ def anonymized_device_id(address):
 
 def hex_value(value, limit=256):
     return bytes(value).hex()[:limit]
+
+
+def save_report(report):
+    REPORT_PATH.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 async def observe(seconds):
@@ -64,6 +71,8 @@ async def main():
         "events": [],
         "markers": [],
     }
+    # 先建立文件；即使后续连接或人工步骤中断，也不会再出现“找不到报告”。
+    save_report(report)
     started_at = time.monotonic()
 
     def marker(label):
@@ -165,9 +174,12 @@ async def main():
                             flush=True,
                         )
 
+        save_report(report)
+
         marker("静置基线开始")
         print(f"保持不操作 {BASELINE_SECONDS} 秒。", flush=True)
         await observe(BASELINE_SECONDS)
+        save_report(report)
 
         marker("实体加热键开启观察开始")
         await asyncio.to_thread(
@@ -176,6 +188,7 @@ async def main():
         )
         marker("用户报告已按开启")
         await observe(ACTION_OBSERVE_SECONDS)
+        save_report(report)
 
         marker("实体加热键关闭观察开始")
         await asyncio.to_thread(
@@ -184,6 +197,7 @@ async def main():
         )
         marker("用户报告已按关闭")
         await observe(ACTION_OBSERVE_SECONDS)
+        save_report(report)
 
         for characteristic in subscribed:
             try:
@@ -191,10 +205,7 @@ async def main():
             except Exception:
                 pass
 
-    REPORT_PATH.write_text(
-        json.dumps(report, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    save_report(report)
     print(f"\n✅ 已保存只读报告：{REPORT_PATH.resolve()}", flush=True)
     print("把 gatt_report.json 发给哥哥；不要发送 BRIDGE_SECRET。", flush=True)
 
