@@ -31,6 +31,10 @@ class ScanSafetyTests(unittest.TestCase):
         self.assertEqual(len(identifier), 12)
         self.assertNotIn("AA", identifier.upper())
 
+    def test_report_is_saved_next_to_probe(self):
+        self.assertEqual(scan.REPORT_PATH.name, "gatt_report.json")
+        self.assertEqual(scan.REPORT_PATH.parent, MODULE_PATH.parent)
+
     def test_probe_contains_no_vendor_characteristic_write_call(self):
         tree = ast.parse(MODULE_PATH.read_text(encoding="utf-8"))
         called_attributes = {
