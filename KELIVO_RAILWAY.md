@@ -3,7 +3,7 @@
 这套补充实现把项目分成两部分：
 
 - Railway：运行标准 MCP（Streamable HTTP）和短时命令队列，不接触蓝牙。
-- 设备附近的 Windows/Mac/Linux 电脑：运行 `bridge.py`，连接 SL278H 并轮询 Railway。
+- 设备附近的 Windows/Mac/Linux 电脑：运行 `bridge.py`，连接 SL278H 或 SL278K 并轮询 Railway。
 
 ## 1. Railway 配置
 
@@ -57,6 +57,8 @@ https://你的域名/health
 - `toy_set_pattern`
 - `toy_stop`
 
+在 SL278K 上，`toy_set_speed` 控制 1 档振动的强度，`toy_set_pattern` 控制振动花样，`toy_stop` 会向振动、伸缩、吸吮等已知通道都发送归零帧。当前版本不会通过通用“强度”工具意外启动伸缩或吸吮通道。
+
 建议先在 Kelivo 中把 `toy_set_speed` 和 `toy_set_pattern` 标记为“需要批准”。`toy_stop` 不建议增加批准步骤，以便随时停止。
 
 ## 3. 在设备附近启动电脑蓝牙中继
@@ -67,11 +69,17 @@ https://你的域名/health
 pip install bleak requests
 ```
 
+建议升级到较新的 Bleak；Windows 连接使用 60 秒超时、指定服务过滤并绕过旧 GATT 缓存：
+
+```powershell
+python -m pip install --upgrade bleak requests
+```
+
 Windows PowerShell：
 
 ```powershell
 $env:BRIDGE_URL="https://你的域名"
-$env:BRIDGE_SECRET="与Railway完全相同的密钥"
+$env:BRIDGE_SECRET=Read-Host "粘贴与 Railway 完全相同的密钥"
 python bridge.py
 ```
 
@@ -85,16 +93,35 @@ python bridge.py
 
 看到“就绪！等待指令中...”后，再让 Kelivo 调用 `toy_status`；状态应显示蓝牙中继在线、设备已就绪。
 
+### SL278K 首次连接
+
+SL278K 会广播 `0000e0ff-...`，连接后提供 `FFE0/FFE1/FFE2` 和 `AE00/AE01/AE02`。脚本会自动识别设备名中的 `SL278K`，启用通知，然后发送该型号所需的初始化序列并立即发送所有已知停止帧。
+
+首次运行前：
+
+- 完全退出官方 App，并关闭附近手机蓝牙，避免设备被手机占用。
+- 不要在充电时连接。
+- 将设备放在稳定表面上，暂时不要佩戴或使用，并确保实体停止键随手可按。初始化序列可能造成极短暂动作。
+- Windows 不要手动配对该设备；由 `bridge.py` 直接连接 BLE 广播。
+
+看到以下内容才表示握手完成：
+
+```text
+🔐 执行 SL278K 初始化握手...
+🎉 就绪！等待指令中（SL278K）...
+```
+
 ## 4. 安全行为
 
 - 所有动作都有有限时长，默认 30 秒，服务端最大值默认 300 秒。
 - 未检测到蓝牙设备就绪时，服务端拒绝启动动作。
 - 蓝牙断开会清空当前动作，重连后不会自动恢复旧动作。
+- 本地程序正常退出时会尽力向所有已知通道发送停止帧。
 - 未发送的动作只有数秒有效，并且只保留最新一条，防止断线后重放。
 - Railway 重启或失联时，本地 `bridge.py` 仍会按指令时长自动停止。
 - `BRIDGE_SECRET` 只放 Railway Variables、Kelivo 请求头和电脑临时环境变量；不要写进仓库、URL、截图或日志。
 
-首次测试建议保持设备在手边，先用低强度和 3–5 秒时长验证，并确保能立即使用实体按键停止。
+首次动作测试必须让设备保持未佩戴/未使用状态，先用 10% 强度和 3 秒时长验证，并确保能立即使用实体按键停止。
 
 ## 5. 常见问题
 
