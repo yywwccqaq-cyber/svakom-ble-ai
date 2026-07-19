@@ -21,6 +21,7 @@ SERVICE_UUID = "0000ffe0-0000-1000-8000-00805f9b34fb"
 ALT_SERVICE_UUID = "0000ae00-0000-1000-8000-00805f9b34fb"
 WRITE_UUID = "0000ffe1-0000-1000-8000-00805f9b34fb"
 NOTIFY_UUID = "0000ffe2-0000-1000-8000-00805f9b34fb"
+ALT_NOTIFY_UUID = "0000ae02-0000-1000-8000-00805f9b34fb"
 
 PROFILE_SL278H = "sl278h"
 PROFILE_SL278K = "sl278k"
@@ -53,6 +54,7 @@ current_frames = None
 current_until = 0.0
 client_ref = None
 device_profile = None
+last_notifications = {"ffe2": None, "ae02": None}
 
 
 def log(message):
@@ -92,6 +94,12 @@ def stop_frames(profile):
     return tuple(frames)
 
 
+def profile_capabilities(profile):
+    if profile == PROFILE_SL278K:
+        return ("vibration", "stretch", "suction")
+    return ("vibration",)
+
+
 def parse_duration(command):
     seconds = DEFAULT_DURATION_SEC
     for key in ("sec", "seconds", "duration"):
@@ -110,6 +118,26 @@ def command_value(command):
 
 
 def action_frames(command, profile):
+    action = str(command.get("action", "")).lower()
+    if action in {"vibration", "stretch", "suction"}:
+        opcode, max_mode = {
+            "vibration": (0x03, 10 if profile == PROFILE_SL278K else 8),
+            "stretch": (0x08, 7),
+            "suction": (0x09, 5),
+        }[action]
+        if action != "vibration" and profile != PROFILE_SL278K:
+            return ()
+        strength = round(float(command.get("level", 0.3)) * 10)
+        return (
+            cmd_mode(
+                opcode,
+                command.get("mode", 1),
+                strength,
+                max_mode=max_mode,
+                max_strength=10,
+            ),
+        )
+
     if "pattern" in command:
         max_mode = 10 if profile == PROFILE_SL278K else 8
         max_strength = 10 if profile == PROFILE_SL278K else 5
@@ -167,10 +195,33 @@ async def write_frames(frames, *, client=None, pause=0.04):
     return wrote_all
 
 
+def notification_handler(channel):
+    def handle(_sender, data):
+        last_notifications[channel] = {
+            "hex": bytes(data).hex()[:128],
+            "at": time.monotonic(),
+        }
+
+    return handle
+
+
+def notification_headers():
+    headers = {}
+    now = time.monotonic()
+    for channel, entry in last_notifications.items():
+        if not entry:
+            continue
+        headers[f"x-bridge-{channel}"] = entry["hex"]
+        headers[f"x-bridge-{channel}-age-ms"] = str(
+            max(0, round((now - entry["at"]) * 1_000))
+        )
+    return headers
+
+
 async def initialize_sl278k(client):
     # Notifications are enabled first so acknowledgements are not missed.
     try:
-        await client.start_notify(NOTIFY_UUID, lambda _sender, _data: None)
+        await client.start_notify(NOTIFY_UUID, notification_handler("ffe2"))
     except Exception as error:
         log(f"⚠️ 通知启用失败，将继续尝试握手: {error}")
     await asyncio.sleep(0.24)
@@ -178,6 +229,10 @@ async def initialize_sl278k(client):
         raise RuntimeError("SL278K 初始化握手写入失败")
     # End initialization in an explicitly neutral state.
     await write_frames(stop_frames(PROFILE_SL278K), client=client, pause=0.02)
+    try:
+        await client.start_notify(ALT_NOTIFY_UUID, notification_handler("ae02"))
+    except Exception as error:
+        log(f"⚠️ AE02 通知启用失败，只读状态将缺少该通道: {error}")
 
 
 async def exec_cmd(command):
@@ -212,6 +267,17 @@ async def exec_cmd(command):
             f"🌀 振动花样 {int(command['pattern'])}，强度 "
             f"{round(float(command.get('level', 0.6)) * 100)}%"
         )
+    elif command.get("action"):
+        labels = {
+            "vibration": "振动",
+            "stretch": "伸缩",
+            "suction": "吸吮",
+        }
+        action = str(command["action"]).lower()
+        log(
+            f"🧩 {labels.get(action, action)}模式 {int(command.get('mode', 1))}，"
+            f"强度 {round(float(command.get('level', 0.3)) * 100)}%"
+        )
     else:
         log(f"📳 振动强度 {round(float(command_value(command)) * 100)}%")
 
@@ -244,6 +310,12 @@ async def bridge_loop():
             "x-bridge-secret": BRIDGE_SECRET,
             "x-bridge-ready": "1" if ready else "0",
         }
+        if ready:
+            headers["x-bridge-profile"] = device_profile
+            headers["x-bridge-capabilities"] = ",".join(
+                profile_capabilities(device_profile)
+            )
+            headers.update(notification_headers())
         try:
             response = await asyncio.to_thread(
                 requests.get,
@@ -295,7 +367,7 @@ async def ble_loop():
                 else:
                     try:
                         await client.start_notify(
-                            NOTIFY_UUID, lambda _sender, _data: None
+                            NOTIFY_UUID, notification_handler("ffe2")
                         )
                     except Exception:
                         pass
