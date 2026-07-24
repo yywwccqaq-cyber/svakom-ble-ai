@@ -18,6 +18,11 @@ function resultData(result) {
   return separator >= 0 ? JSON.parse(text.slice(separator + 1)) : {};
 }
 
+function assertRejected(result) {
+  assert.notEqual(result.isError, true);
+  assert.equal(resultData(result).ok, false);
+}
+
 async function armAction(action) {
   const result = await client.callTool({
     name: "toy_arm_action",
@@ -25,6 +30,7 @@ async function armAction(action) {
   });
   assert.notEqual(result.isError, true);
   const data = resultData(result);
+  assert.equal(data.ok, true);
   assert.equal(data.action, action);
   assert.equal(typeof data.action_token, "string");
   return data.action_token;
@@ -99,7 +105,7 @@ test("activation is rejected until the BLE device reports ready", async () => {
     name: "toy_set_speed",
     arguments: { speed: 0.5, duration_seconds: 10 },
   });
-  assert.equal(result.isError, true);
+  assertRejected(result);
 });
 
 test("action tokens expire after their short safety window", () => {
@@ -131,7 +137,7 @@ test("ready bridge receives a finite-duration command exactly once", async () =>
     name: "toy_set_speed",
     arguments: { speed: 0.65, duration_seconds: 12 },
   });
-  assert.equal(staleReplay.isError, true);
+  assertRejected(staleReplay);
   const afterRejectedReplay = await fetch(`${baseUrl}/toy-next`, {
     headers: pollHeaders,
   });
@@ -167,7 +173,7 @@ test("ready bridge receives a finite-duration command exactly once", async () =>
       duration_seconds: 12,
     },
   });
-  assert.equal(repeatedCall.isError, true);
+  assertRejected(repeatedCall);
   const afterRepeatedCall = await fetch(`${baseUrl}/toy-next`, {
     headers: pollHeaders,
   });
@@ -185,7 +191,7 @@ test("actuator-specific tools reject a bridge that did not report capabilities",
       duration_seconds: 3,
     },
   });
-  assert.equal(result.isError, true);
+  assertRejected(result);
 });
 
 test("SL278K capabilities enable bounded stretch, suction, and BLE status", async () => {
@@ -293,7 +299,7 @@ test("a disconnect clears unsafe pending actions but retains stop", async () => 
       duration_seconds: 3,
     },
   });
-  assert.equal(staleAfterDisconnect.isError, true);
+  assertRejected(staleAfterDisconnect);
   const afterStaleToken = await fetch(`${baseUrl}/toy-next`, {
     headers: readyHeaders,
   });

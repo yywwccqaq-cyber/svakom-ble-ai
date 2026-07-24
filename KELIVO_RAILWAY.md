@@ -65,6 +65,8 @@ https://你的域名/health
 
 所有非零动作都必须先调用 `toy_arm_action` 获取对应动作的一次性令牌。令牌 30 秒后过期，成功使用一次后立即失效，旧会话重放或重复提交原动作时会被拒绝。建议在 Kelivo 中把 `toy_arm_action`、`toy_set_speed`、`toy_set_pattern`、`toy_set_stretch` 和 `toy_set_suction` 全部标记为“需要批准”。`toy_status`、`toy_ble_status` 是只读工具；`toy_stop` 不需要令牌，也不建议增加批准步骤，以便随时停止。
 
+为兼容 Kelivo，设备未就绪、缺少令牌或令牌过期等安全拒绝会作为普通工具文本结果返回，并在结果 JSON 中标记 `"ok": false`；它们不会进入动作队列。这样既保持拒绝动作，又避免客户端丢失 MCP `isError` 后形成没有 `tool_result` 的 Claude 消息。
+
 没有暴露任意十六进制写入。SL278K 的 `AE01` 在现有技术记录中没有产生控制响应；加热帧的通道索引和温控语义也尚未通过实机验证，因此这两项不会作为 MCP 写入工具出现。
 
 ## 3. 在设备附近启动电脑蓝牙中继

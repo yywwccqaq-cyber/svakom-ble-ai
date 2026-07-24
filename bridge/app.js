@@ -32,12 +32,14 @@ function bearerToken(request) {
   return match?.[1]?.trim() ?? "";
 }
 
-function textResult(message, data = {}, isError = false) {
-  const details =
-    Object.keys(data).length > 0 ? `\n${JSON.stringify(data)}` : "";
+function textResult(message, data = {}, rejected = false) {
+  // Kelivo currently loses some MCP results carrying `isError: true`, which
+  // leaves an orphaned Anthropic tool_use block and breaks the next request.
+  // Business-level rejections stay fail-closed, but travel as ordinary text
+  // results with an explicit `ok: false` payload so the client records them.
+  const details = `\n${JSON.stringify({ ok: !rejected, ...data })}`;
   return {
     content: [{ type: "text", text: `${message}${details}` }],
-    ...(isError ? { isError: true } : {}),
   };
 }
 
@@ -272,7 +274,7 @@ export class RelayState {
 function createToyMcpServer(state, { maxDurationSeconds }) {
   const server = new McpServer({
     name: "svakom-kelivo-bridge",
-    version: "1.2.0",
+    version: "1.2.1",
   });
 
   const requireReady = () => {
@@ -343,7 +345,6 @@ function createToyMcpServer(state, { maxDurationSeconds }) {
       inputSchema: {
         action_token: z
           .string()
-          .uuid()
           .optional()
           .describe("toy_arm_action 为 speed 签发的一次性令牌；speed=0 时可省略"),
         speed: z
@@ -399,7 +400,7 @@ function createToyMcpServer(state, { maxDurationSeconds }) {
       inputSchema: {
         action_token: z
           .string()
-          .uuid()
+          .optional()
           .describe("toy_arm_action 为 pattern 签发的一次性令牌"),
         pattern: z.number().int().min(1).max(8).describe("花样档位，1 到 8"),
         level: z
@@ -445,7 +446,7 @@ function createToyMcpServer(state, { maxDurationSeconds }) {
       inputSchema: {
         action_token: z
           .string()
-          .uuid()
+          .optional()
           .describe("toy_arm_action 为 stretch 签发的一次性令牌"),
         mode: z.number().int().min(1).max(7).describe("伸缩模式，1 到 7"),
         strength: z
@@ -497,7 +498,7 @@ function createToyMcpServer(state, { maxDurationSeconds }) {
       inputSchema: {
         action_token: z
           .string()
-          .uuid()
+          .optional()
           .describe("toy_arm_action 为 suction 签发的一次性令牌"),
         mode: z.number().int().min(1).max(5).describe("吸吮模式，1 到 5"),
         strength: z
