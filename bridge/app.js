@@ -274,7 +274,7 @@ export class RelayState {
 function createToyMcpServer(state, { maxDurationSeconds }) {
   const server = new McpServer({
     name: "svakom-kelivo-bridge",
-    version: "1.2.1",
+    version: "1.2.2",
   });
 
   const requireReady = () => {
@@ -678,7 +678,11 @@ export function createRelayApp({
     });
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
-      enableJsonResponse: true,
+      // SSE is the Streamable HTTP default and the most broadly compatible
+      // response mode. Kelivo can list tools from JSON responses but may lose
+      // call results before they are converted into Anthropic tool_result
+      // blocks, so keep the endpoint on the preferred SSE path.
+      enableJsonResponse: false,
     });
 
     try {

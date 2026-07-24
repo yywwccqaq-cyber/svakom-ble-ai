@@ -100,6 +100,30 @@ test("Kelivo-style Streamable HTTP client lists all tools", async () => {
   );
 });
 
+test("MCP call responses use the preferred SSE transport", async () => {
+  const response = await fetch(`${baseUrl}/mcp`, {
+    method: "POST",
+    headers: {
+      accept: "application/json, text/event-stream",
+      authorization: `Bearer ${SECRET}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 91,
+      method: "tools/call",
+      params: { name: "toy_status", arguments: {} },
+    }),
+  });
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get("content-type") ?? "", /^text\/event-stream/);
+  const body = await response.text();
+  assert.match(body, /event: message/);
+  assert.match(body, /"jsonrpc":"2.0"/);
+  assert.match(body, /"id":91/);
+  assert.match(body, /\\"ok\\":true/);
+});
+
 test("activation is rejected until the BLE device reports ready", async () => {
   const result = await client.callTool({
     name: "toy_set_speed",
