@@ -124,6 +124,29 @@ test("MCP call responses use the preferred SSE transport", async () => {
   assert.match(body, /\\"ok\\":true/);
 });
 
+test("authenticated MCP audit records metadata but never tool arguments", async () => {
+  const response = await fetch(`${baseUrl}/mcp-audit`, {
+    headers: { "x-bridge-secret": SECRET },
+  });
+  assert.equal(response.status, 200);
+  const audit = await response.json();
+  assert.equal(audit.ok, true);
+  const statusCall = audit.entries.find((entry) =>
+    entry.requests.some(
+      (request) =>
+        request.method === "tools/call" && request.tool_name === "toy_status",
+    ),
+  );
+  assert.equal(statusCall.completed, true);
+  assert.equal(statusCall.response_status, 200);
+  assert.match(statusCall.response_content_type, /^text\/event-stream/);
+  assert.equal(JSON.stringify(audit).includes("arguments"), false);
+  assert.equal(JSON.stringify(audit).includes(SECRET), false);
+
+  const unauthorized = await fetch(`${baseUrl}/mcp-audit`);
+  assert.equal(unauthorized.status, 401);
+});
+
 test("activation is rejected until the BLE device reports ready", async () => {
   const result = await client.callTool({
     name: "toy_set_speed",

@@ -75,6 +75,24 @@ function boundedAgeMs(value) {
   return Math.min(parsed, 86_400_000);
 }
 
+function summarizeMcpRequest(body) {
+  const messages = Array.isArray(body) ? body : [body];
+  return messages
+    .filter((message) => message && typeof message === "object")
+    .map((message) => ({
+      rpc_id:
+        typeof message.id === "string" || typeof message.id === "number"
+          ? message.id
+          : null,
+      method: typeof message.method === "string" ? message.method : null,
+      tool_name:
+        message.method === "tools/call" &&
+        typeof message.params?.name === "string"
+          ? message.params.name
+          : null,
+    }));
+}
+
 export class RelayState {
   constructor({
     now = () => Date.now(),
@@ -274,7 +292,7 @@ export class RelayState {
 function createToyMcpServer(state, { maxDurationSeconds }) {
   const server = new McpServer({
     name: "svakom-kelivo-bridge",
-    version: "1.2.2",
+    version: "1.2.3",
   });
 
   const requireReady = () => {
@@ -625,6 +643,8 @@ export function createRelayApp({
     3_600,
   );
   const app = createMcpExpressApp({ host: "0.0.0.0" });
+  const mcpAudit = [];
+  let nextAuditSequence = 1;
 
   const requireMcpAuth = (request, response, next) => {
     if (constantTimeEqual(bearerToken(request), normalizedSecret)) return next();
@@ -644,6 +664,15 @@ export function createRelayApp({
   app.get("/health", (_request, response) => {
     response.set("Cache-Control", "no-store");
     response.json({ ok: true, service: "svakom-kelivo-bridge" });
+  });
+
+  app.get("/mcp-audit", requireBridgeAuth, (_request, response) => {
+    response.set("Cache-Control", "no-store");
+    response.json({
+      ok: true,
+      generated_at: new Date().toISOString(),
+      entries: mcpAudit.map((entry) => ({ ...entry })),
+    });
   });
 
   app.get("/toy-next", requireBridgeAuth, (request, response) => {
@@ -673,6 +702,38 @@ export function createRelayApp({
   });
 
   app.post("/mcp", requireMcpAuth, async (request, response) => {
+    const startedAt = Date.now();
+    const auditEntry = {
+      sequence: nextAuditSequence,
+      received_at: new Date(startedAt).toISOString(),
+      requests: summarizeMcpRequest(request.body),
+      accept: String(request.get("accept") ?? "").slice(0, 160),
+      response_status: null,
+      response_content_type: null,
+      duration_ms: null,
+      completed: false,
+    };
+    nextAuditSequence += 1;
+    mcpAudit.push(auditEntry);
+    if (mcpAudit.length > 30) mcpAudit.shift();
+
+    response.once("finish", () => {
+      auditEntry.response_status = response.statusCode;
+      auditEntry.response_content_type = String(
+        response.getHeader("content-type") ?? "",
+      ).slice(0, 160);
+      auditEntry.duration_ms = Date.now() - startedAt;
+      auditEntry.completed = true;
+    });
+    response.once("close", () => {
+      if (auditEntry.completed) return;
+      auditEntry.response_status = response.statusCode || null;
+      auditEntry.response_content_type = String(
+        response.getHeader("content-type") ?? "",
+      ).slice(0, 160);
+      auditEntry.duration_ms = Date.now() - startedAt;
+    });
+
     const server = createToyMcpServer(state, {
       maxDurationSeconds: maximumDuration,
     });
