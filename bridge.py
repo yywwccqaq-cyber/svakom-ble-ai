@@ -159,18 +159,11 @@ def action_frames(command, profile):
     if value <= 0:
         return stop_frames(profile)
     if profile == PROFILE_SL278K:
-        # For the K profile, the existing generic speed tool controls vibration
-        # mode 1 at a 1..10 strength. Stretch/suction are intentionally not
-        # activated by this generic command.
-        return (
-            cmd_mode(
-                0x03,
-                1,
-                round(value * 10),
-                max_mode=10,
-                max_strength=10,
-            ),
-        )
+        # This SL278K hardware acknowledged 0x03 writes but did not move. The
+        # 0x04 scale family is also used by its verified initialization sequence
+        # and produced a physical response, so generic speed uses that family.
+        # Pattern/stretch/suction remain isolated behind their dedicated tools.
+        return (cmd_scale(int(value * 255)),)
     return (cmd_scale(int(value * 255)),)
 
 
@@ -279,7 +272,7 @@ async def exec_cmd(command):
             f"强度 {round(float(command.get('level', 0.3)) * 100)}%"
         )
     else:
-        log(f"📳 振动强度 {round(float(command_value(command)) * 100)}%")
+        log(f"⚙️ 设备强度 {round(float(command_value(command)) * 100)}%")
 
 
 async def keepalive_loop():

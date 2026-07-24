@@ -50,19 +50,20 @@ https://你的域名/health
 }
 ```
 
-连接成功后会显示七个工具：
+连接成功后会显示八个工具：
 
 - `toy_status`
 - `toy_ble_status`（只读显示能力与 FFE2/AE02 最近通知）
+- `toy_arm_action`（为一次动作签发 30 秒有效、仅可使用一次的令牌）
 - `toy_set_speed`
 - `toy_set_pattern`
 - `toy_set_stretch`（SL278K 伸缩模式 1–7）
 - `toy_set_suction`（SL278K 吸吮模式 1–5）
 - `toy_stop`
 
-在 SL278K 上，`toy_set_speed` 控制 1 档振动的强度，`toy_set_pattern` 控制振动花样，`toy_set_stretch` 和 `toy_set_suction` 分别使用已验证范围内的伸缩、吸吮模式。`toy_stop` 会向振动、伸缩、吸吮等已知通道都发送归零帧。通用“强度”工具不会意外启动伸缩或吸吮通道。
+在 SL278K 上，`toy_set_speed` 使用与初始化序列相同、实机有响应迹象的 `0x04` 通用强度帧；具体驱动部件以实机首次低强度测试为准。`toy_set_pattern` 控制振动花样，`toy_set_stretch` 和 `toy_set_suction` 分别使用已验证范围内的伸缩、吸吮模式。`toy_stop` 会向振动、伸缩、吸吮等已知通道都发送归零帧。
 
-建议在 Kelivo 中把 `toy_set_speed`、`toy_set_pattern`、`toy_set_stretch` 和 `toy_set_suction` 全部标记为“需要批准”。`toy_status`、`toy_ble_status` 是只读工具；`toy_stop` 不建议增加批准步骤，以便随时停止。
+所有非零动作都必须先调用 `toy_arm_action` 获取对应动作的一次性令牌。令牌 30 秒后过期，成功使用一次后立即失效，旧会话重放或重复提交原动作时会被拒绝。建议在 Kelivo 中把 `toy_arm_action`、`toy_set_speed`、`toy_set_pattern`、`toy_set_stretch` 和 `toy_set_suction` 全部标记为“需要批准”。`toy_status`、`toy_ble_status` 是只读工具；`toy_stop` 不需要令牌，也不建议增加批准步骤，以便随时停止。
 
 没有暴露任意十六进制写入。SL278K 的 `AE01` 在现有技术记录中没有产生控制响应；加热帧的通道索引和温控语义也尚未通过实机验证，因此这两项不会作为 MCP 写入工具出现。
 

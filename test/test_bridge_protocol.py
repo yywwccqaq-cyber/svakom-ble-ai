@@ -29,11 +29,11 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(bridge.detect_profile("SL278K"), bridge.PROFILE_SL278K)
         self.assertEqual(bridge.detect_profile("SL278H"), bridge.PROFILE_SL278H)
 
-    def test_sl278k_speed_maps_to_vibration_strength(self):
+    def test_sl278k_speed_maps_to_scale_strength(self):
         low = bridge.action_frames({"speed": 0.1}, bridge.PROFILE_SL278K)
         high = bridge.action_frames({"speed": 1.0}, bridge.PROFILE_SL278K)
-        self.assertEqual(low, (bytes.fromhex("55 03 00 00 01 01 00"),))
-        self.assertEqual(high, (bytes.fromhex("55 03 00 00 01 0a 00"),))
+        self.assertEqual(low, (bytes.fromhex("55 04 00 00 01 19 aa"),))
+        self.assertEqual(high, (bytes.fromhex("55 04 00 00 01 ff aa"),))
 
     def test_sl278h_speed_mapping_is_preserved(self):
         frames = bridge.action_frames({"speed": 0.5}, bridge.PROFILE_SL278H)

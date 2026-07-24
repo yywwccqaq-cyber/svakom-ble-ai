@@ -9,7 +9,9 @@ const DEFAULT_DURATION_SECONDS = 30;
 const DEFAULT_MAX_DURATION_SECONDS = 300;
 const DEFAULT_COMMAND_TTL_MS = 5_000;
 const DEFAULT_BRIDGE_ONLINE_WINDOW_MS = 4_000;
+const DEFAULT_ACTION_ARM_TTL_MS = 30_000;
 const KNOWN_CAPABILITIES = new Set(["vibration", "stretch", "suction"]);
+const KNOWN_ACTIONS = new Set(["speed", "pattern", "stretch", "suction"]);
 
 function boundedInteger(value, fallback, minimum, maximum) {
   const parsed = Number.parseInt(String(value ?? ""), 10);
@@ -76,10 +78,12 @@ export class RelayState {
     now = () => Date.now(),
     commandTtlMs = DEFAULT_COMMAND_TTL_MS,
     bridgeOnlineWindowMs = DEFAULT_BRIDGE_ONLINE_WINDOW_MS,
+    actionArmTtlMs = DEFAULT_ACTION_ARM_TTL_MS,
   } = {}) {
     this.now = now;
     this.commandTtlMs = commandTtlMs;
     this.bridgeOnlineWindowMs = bridgeOnlineWindowMs;
+    this.actionArmTtlMs = actionArmTtlMs;
     this.lastBridgeSeenAt = null;
     this.bridgeReady = false;
     this.bridgeProfile = null;
@@ -88,6 +92,7 @@ export class RelayState {
     this.pending = null;
     this.lastDelivered = null;
     this.activeEstimate = null;
+    this.actionArm = null;
   }
 
   touchBridge(ready, { profile, capabilities = [], notifications = {} } = {}) {
@@ -112,6 +117,7 @@ export class RelayState {
     if (!this.bridgeReady) {
       if (this.pending && !this.pending.command.stop) this.pending = null;
       this.activeEstimate = null;
+      this.actionArm = null;
     }
   }
 
@@ -138,6 +144,36 @@ export class RelayState {
     if (this.activeEstimate && this.activeEstimate.until <= currentTime) {
       this.activeEstimate = null;
     }
+    if (this.actionArm && this.actionArm.expiresAt <= currentTime) {
+      this.actionArm = null;
+    }
+  }
+
+  armAction(action) {
+    this.prune();
+    if (!this.isDeviceReady() || !KNOWN_ACTIONS.has(action)) return null;
+    const createdAt = this.now();
+    this.actionArm = {
+      token: randomUUID(),
+      action,
+      createdAt,
+      expiresAt: createdAt + this.actionArmTtlMs,
+    };
+    return { ...this.actionArm };
+  }
+
+  consumeActionToken(token, action) {
+    this.prune();
+    if (
+      !this.isDeviceReady() ||
+      !this.actionArm ||
+      this.actionArm.action !== action ||
+      !constantTimeEqual(this.actionArm.token, token)
+    ) {
+      return false;
+    }
+    this.actionArm = null;
+    return true;
   }
 
   enqueue(command, { ttlMs = this.commandTtlMs } = {}) {
@@ -204,6 +240,15 @@ export class RelayState {
             ),
           }
         : null,
+      action_arm: this.actionArm
+        ? {
+            action: this.actionArm.action,
+            remaining_seconds: Math.max(
+              0,
+              Math.ceil((this.actionArm.expiresAt - now) / 1_000),
+            ),
+          }
+        : null,
       device_profile: deviceReady ? this.bridgeProfile : null,
       capabilities: deviceReady ? [...this.bridgeCapabilities] : [],
       ble_notifications: Object.fromEntries(
@@ -227,7 +272,7 @@ export class RelayState {
 function createToyMcpServer(state, { maxDurationSeconds }) {
   const server = new McpServer({
     name: "svakom-kelivo-bridge",
-    version: "1.1.0",
+    version: "1.2.0",
   });
 
   const requireReady = () => {
@@ -250,13 +295,57 @@ function createToyMcpServer(state, { maxDurationSeconds }) {
     );
   };
 
+  const requireActionToken = (token, action) => {
+    if (state.consumeActionToken(token, action)) return null;
+    return textResult(
+      "动作令牌无效、已使用或已过期，未发送动作。请在用户当前明确要求动作后，重新调用 toy_arm_action 获取一次性令牌。",
+      { requested_action: action, ...state.snapshot() },
+      true,
+    );
+  };
+
+  server.registerTool(
+    "toy_arm_action",
+    {
+      title: "为一次设备动作解锁",
+      description:
+        "仅在用户当前明确要求执行设备动作后调用。为指定动作签发一个 30 秒内有效、仅可使用一次的令牌；旧调用或重复调用无法复用。停止设备不需要令牌。",
+      inputSchema: {
+        action: z
+          .enum(["speed", "pattern", "stretch", "suction"])
+          .describe("即将执行的动作类型"),
+      },
+    },
+    async ({ action }) => {
+      const notReady = requireReady();
+      if (notReady) return notReady;
+      const arm = state.armAction(action);
+      if (!arm) {
+        return textResult("无法签发动作令牌，设备当前未就绪。", state.snapshot(), true);
+      }
+      return textResult(
+        `已为 ${action} 签发一次性动作令牌；30 秒内使用一次后立即失效。`,
+        {
+          action,
+          action_token: arm.token,
+          expires_in_seconds: Math.ceil(state.actionArmTtlMs / 1_000),
+        },
+      );
+    },
+  );
+
   server.registerTool(
     "toy_set_speed",
     {
       title: "设置设备强度",
       description:
-        "仅在用户明确要求控制设备时调用。在 SL278K 上控制振动模式 1 的强度，并在有限时长后自动停止；0 表示立即停止。",
+        "仅在用户明确要求控制设备时调用。非零动作必须先调用 toy_arm_action(action=speed) 并传入一次性令牌；0 表示立即停止且不需要令牌。",
       inputSchema: {
+        action_token: z
+          .string()
+          .uuid()
+          .optional()
+          .describe("toy_arm_action 为 speed 签发的一次性令牌；speed=0 时可省略"),
         speed: z
           .number()
           .min(0)
@@ -271,7 +360,7 @@ function createToyMcpServer(state, { maxDurationSeconds }) {
           .describe(`运行秒数，最长 ${maxDurationSeconds} 秒`),
       },
     },
-    async ({ speed, duration_seconds }) => {
+    async ({ action_token, speed, duration_seconds }) => {
       if (speed === 0) {
         const entry = state.enqueue(
           { stop: true },
@@ -286,6 +375,8 @@ function createToyMcpServer(state, { maxDurationSeconds }) {
 
       const notReady = requireReady();
       if (notReady) return notReady;
+      const invalidToken = requireActionToken(action_token, "speed");
+      if (invalidToken) return invalidToken;
       const entry = state.enqueue({ speed, sec: duration_seconds });
       return textResult(
         `已排队：强度 ${Math.round(speed * 100)}%，运行 ${duration_seconds} 秒后自动停止。`,
@@ -304,8 +395,12 @@ function createToyMcpServer(state, { maxDurationSeconds }) {
     {
       title: "设置振动花样",
       description:
-        "仅在用户明确要求控制设备时调用。设置 1 到 8 档花样和 0 到 1 的强度，并在有限时长后自动停止。",
+        "仅在用户明确要求控制设备时调用。必须先调用 toy_arm_action(action=pattern) 并传入一次性令牌。",
       inputSchema: {
+        action_token: z
+          .string()
+          .uuid()
+          .describe("toy_arm_action 为 pattern 签发的一次性令牌"),
         pattern: z.number().int().min(1).max(8).describe("花样档位，1 到 8"),
         level: z
           .number()
@@ -322,9 +417,11 @@ function createToyMcpServer(state, { maxDurationSeconds }) {
           .describe(`运行秒数，最长 ${maxDurationSeconds} 秒`),
       },
     },
-    async ({ pattern, level, duration_seconds }) => {
+    async ({ action_token, pattern, level, duration_seconds }) => {
       const notReady = requireReady();
       if (notReady) return notReady;
+      const invalidToken = requireActionToken(action_token, "pattern");
+      if (invalidToken) return invalidToken;
       const entry = state.enqueue({ pattern, level, sec: duration_seconds });
       return textResult(
         `已排队：花样 ${pattern}，强度 ${Math.round(level * 100)}%，运行 ${duration_seconds} 秒后自动停止。`,
@@ -344,8 +441,12 @@ function createToyMcpServer(state, { maxDurationSeconds }) {
     {
       title: "设置伸缩模式",
       description:
-        "仅在用户明确要求伸缩动作时调用。设置 SL278K 的 1 到 7 档伸缩模式和有限时长；不会启动吸吮或加热。",
+        "仅在用户明确要求伸缩动作时调用。必须先调用 toy_arm_action(action=stretch) 并传入一次性令牌；不会启动吸吮或加热。",
       inputSchema: {
+        action_token: z
+          .string()
+          .uuid()
+          .describe("toy_arm_action 为 stretch 签发的一次性令牌"),
         mode: z.number().int().min(1).max(7).describe("伸缩模式，1 到 7"),
         strength: z
           .number()
@@ -362,9 +463,11 @@ function createToyMcpServer(state, { maxDurationSeconds }) {
           .describe(`运行秒数，最长 ${maxDurationSeconds} 秒`),
       },
     },
-    async ({ mode, strength, duration_seconds }) => {
+    async ({ action_token, mode, strength, duration_seconds }) => {
       const unavailable = requireCapability("stretch", "伸缩");
       if (unavailable) return unavailable;
+      const invalidToken = requireActionToken(action_token, "stretch");
+      if (invalidToken) return invalidToken;
       const entry = state.enqueue({
         action: "stretch",
         mode,
@@ -390,8 +493,12 @@ function createToyMcpServer(state, { maxDurationSeconds }) {
     {
       title: "设置吸吮模式",
       description:
-        "仅在用户明确要求吸吮动作时调用。设置 SL278K 的 1 到 5 档吸吮模式和有限时长；不会启动伸缩或加热。",
+        "仅在用户明确要求吸吮动作时调用。必须先调用 toy_arm_action(action=suction) 并传入一次性令牌；不会启动伸缩或加热。",
       inputSchema: {
+        action_token: z
+          .string()
+          .uuid()
+          .describe("toy_arm_action 为 suction 签发的一次性令牌"),
         mode: z.number().int().min(1).max(5).describe("吸吮模式，1 到 5"),
         strength: z
           .number()
@@ -408,9 +515,11 @@ function createToyMcpServer(state, { maxDurationSeconds }) {
           .describe(`运行秒数，最长 ${maxDurationSeconds} 秒`),
       },
     },
-    async ({ mode, strength, duration_seconds }) => {
+    async ({ action_token, mode, strength, duration_seconds }) => {
       const unavailable = requireCapability("suction", "吸吮");
       if (unavailable) return unavailable;
+      const invalidToken = requireActionToken(action_token, "suction");
+      if (invalidToken) return invalidToken;
       const entry = state.enqueue({
         action: "suction",
         mode,

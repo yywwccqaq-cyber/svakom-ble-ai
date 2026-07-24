@@ -12,6 +12,24 @@ let httpServer;
 let client;
 let transport;
 
+function resultData(result) {
+  const text = result.content?.find((item) => item.type === "text")?.text ?? "";
+  const separator = text.indexOf("\n");
+  return separator >= 0 ? JSON.parse(text.slice(separator + 1)) : {};
+}
+
+async function armAction(action) {
+  const result = await client.callTool({
+    name: "toy_arm_action",
+    arguments: { action },
+  });
+  assert.notEqual(result.isError, true);
+  const data = resultData(result);
+  assert.equal(data.action, action);
+  assert.equal(typeof data.action_token, "string");
+  return data.action_token;
+}
+
 before(async () => {
   const state = new RelayState();
   const { app } = createRelayApp({ secret: SECRET, state });
@@ -64,6 +82,7 @@ test("Kelivo-style Streamable HTTP client lists all tools", async () => {
   assert.deepEqual(
     result.tools.map((tool) => tool.name).sort(),
     [
+      "toy_arm_action",
       "toy_ble_status",
       "toy_set_pattern",
       "toy_set_speed",
@@ -83,6 +102,22 @@ test("activation is rejected until the BLE device reports ready", async () => {
   assert.equal(result.isError, true);
 });
 
+test("action tokens expire after their short safety window", () => {
+  let now = 1_000;
+  const state = new RelayState({
+    now: () => now,
+    bridgeOnlineWindowMs: 60_000,
+    actionArmTtlMs: 1_000,
+  });
+  state.touchBridge(true);
+  const armed = state.armAction("speed");
+  assert.equal(typeof armed?.token, "string");
+
+  now += 1_001;
+  assert.equal(state.consumeActionToken(armed.token, "speed"), false);
+  assert.equal(state.actionArm, null);
+});
+
 test("ready bridge receives a finite-duration command exactly once", async () => {
   const pollHeaders = {
     "x-bridge-secret": SECRET,
@@ -92,9 +127,24 @@ test("ready bridge receives a finite-duration command exactly once", async () =>
   assert.equal(firstPoll.status, 200);
   assert.equal((await firstPoll.json()).type, "hello");
 
-  const call = await client.callTool({
+  const staleReplay = await client.callTool({
     name: "toy_set_speed",
     arguments: { speed: 0.65, duration_seconds: 12 },
+  });
+  assert.equal(staleReplay.isError, true);
+  const afterRejectedReplay = await fetch(`${baseUrl}/toy-next`, {
+    headers: pollHeaders,
+  });
+  assert.equal((await afterRejectedReplay.json()).type, "hello");
+
+  const actionToken = await armAction("speed");
+  const call = await client.callTool({
+    name: "toy_set_speed",
+    arguments: {
+      action_token: actionToken,
+      speed: 0.65,
+      duration_seconds: 12,
+    },
   });
   assert.notEqual(call.isError, true);
 
@@ -108,12 +158,32 @@ test("ready bridge receives a finite-duration command exactly once", async () =>
 
   const secondPoll = await fetch(`${baseUrl}/toy-next`, { headers: pollHeaders });
   assert.equal((await secondPoll.json()).type, "hello");
+
+  const repeatedCall = await client.callTool({
+    name: "toy_set_speed",
+    arguments: {
+      action_token: actionToken,
+      speed: 0.65,
+      duration_seconds: 12,
+    },
+  });
+  assert.equal(repeatedCall.isError, true);
+  const afterRepeatedCall = await fetch(`${baseUrl}/toy-next`, {
+    headers: pollHeaders,
+  });
+  assert.equal((await afterRepeatedCall.json()).type, "hello");
 });
 
 test("actuator-specific tools reject a bridge that did not report capabilities", async () => {
+  const actionToken = await armAction("stretch");
   const result = await client.callTool({
     name: "toy_set_stretch",
-    arguments: { mode: 1, strength: 0.1, duration_seconds: 3 },
+    arguments: {
+      action_token: actionToken,
+      mode: 1,
+      strength: 0.1,
+      duration_seconds: 3,
+    },
   });
   assert.equal(result.isError, true);
 });
@@ -132,9 +202,15 @@ test("SL278K capabilities enable bounded stretch, suction, and BLE status", asyn
 
   await fetch(`${baseUrl}/toy-next`, { headers: sl278kHeaders });
 
+  const stretchToken = await armAction("stretch");
   const stretchCall = await client.callTool({
     name: "toy_set_stretch",
-    arguments: { mode: 2, strength: 0.1, duration_seconds: 3 },
+    arguments: {
+      action_token: stretchToken,
+      mode: 2,
+      strength: 0.1,
+      duration_seconds: 3,
+    },
   });
   assert.notEqual(stretchCall.isError, true);
   const stretch = await (
@@ -145,9 +221,15 @@ test("SL278K capabilities enable bounded stretch, suction, and BLE status", asyn
   assert.equal(stretch.level, 0.1);
   assert.equal(stretch.sec, 3);
 
+  const suctionToken = await armAction("suction");
   const suctionCall = await client.callTool({
     name: "toy_set_suction",
-    arguments: { mode: 1, strength: 0.1, duration_seconds: 3 },
+    arguments: {
+      action_token: suctionToken,
+      mode: 1,
+      strength: 0.1,
+      duration_seconds: 3,
+    },
   });
   assert.notEqual(suctionCall.isError, true);
   const suction = await (
@@ -163,14 +245,16 @@ test("SL278K capabilities enable bounded stretch, suction, and BLE status", asyn
     arguments: {},
   });
   assert.notEqual(status.isError, true);
-  assert.equal(status.structuredContent.device_profile, "sl278k");
-  assert.deepEqual(status.structuredContent.capabilities, [
+  assert.equal(status.structuredContent, undefined);
+  const statusData = resultData(status);
+  assert.equal(statusData.device_profile, "sl278k");
+  assert.deepEqual(statusData.capabilities, [
     "vibration",
     "stretch",
     "suction",
   ]);
-  assert.equal(status.structuredContent.ble_notifications.ffe2.hex, "55aa");
-  assert.equal(status.structuredContent.ble_notifications.ae02.hex, "0102");
+  assert.equal(statusData.ble_notifications.ffe2.hex, "55aa");
+  assert.equal(statusData.ble_notifications.ae02.hex, "0102");
 });
 
 test("a disconnect clears unsafe pending actions but retains stop", async () => {
@@ -184,15 +268,36 @@ test("a disconnect clears unsafe pending actions but retains stop", async () => 
   };
 
   await fetch(`${baseUrl}/toy-next`, { headers: readyHeaders });
+  const patternToken = await armAction("pattern");
   await client.callTool({
     name: "toy_set_pattern",
-    arguments: { pattern: 3, level: 0.7, duration_seconds: 10 },
+    arguments: {
+      action_token: patternToken,
+      pattern: 3,
+      level: 0.7,
+      duration_seconds: 10,
+    },
   });
+  const disconnectedToken = await armAction("speed");
   await fetch(`${baseUrl}/toy-next`, { headers: disconnectedHeaders });
   const afterReconnect = await fetch(`${baseUrl}/toy-next`, {
     headers: readyHeaders,
   });
   assert.equal((await afterReconnect.json()).type, "hello");
+
+  const staleAfterDisconnect = await client.callTool({
+    name: "toy_set_speed",
+    arguments: {
+      action_token: disconnectedToken,
+      speed: 0.2,
+      duration_seconds: 3,
+    },
+  });
+  assert.equal(staleAfterDisconnect.isError, true);
+  const afterStaleToken = await fetch(`${baseUrl}/toy-next`, {
+    headers: readyHeaders,
+  });
+  assert.equal((await afterStaleToken.json()).type, "hello");
 
   await client.callTool({ name: "toy_stop", arguments: {} });
   const stopResponse = await fetch(`${baseUrl}/toy-next`, {
