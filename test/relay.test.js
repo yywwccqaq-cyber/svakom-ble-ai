@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
 import { createRelayApp, RelayState } from "../bridge/app.js";
@@ -11,6 +12,8 @@ let baseUrl;
 let httpServer;
 let client;
 let transport;
+let legacyClient;
+let legacyTransport;
 
 function resultData(result) {
   const text = result.content?.find((item) => item.type === "text")?.text ?? "";
@@ -46,6 +49,7 @@ before(async () => {
 });
 
 after(async () => {
+  await legacyTransport?.close().catch(() => {});
   await transport?.close().catch(() => {});
   await new Promise((resolve) => httpServer.close(resolve));
 });
@@ -124,6 +128,29 @@ test("MCP call responses use the preferred SSE transport", async () => {
   assert.match(body, /\\"ok\\":true/);
 });
 
+test("Kelivo legacy SSE transport lists and calls tools successfully", async () => {
+  legacyTransport = new SSEClientTransport(new URL(`${baseUrl}/sse`), {
+    requestInit: {
+      headers: { Authorization: `Bearer ${SECRET}` },
+    },
+  });
+  legacyClient = new Client({
+    name: "kelivo-legacy-sse-test",
+    version: "1.0.0",
+  });
+  await legacyClient.connect(legacyTransport);
+
+  const tools = await legacyClient.listTools();
+  assert.equal(tools.tools.some((tool) => tool.name === "toy_status"), true);
+
+  const status = await legacyClient.callTool({
+    name: "toy_status",
+    arguments: {},
+  });
+  assert.notEqual(status.isError, true);
+  assert.equal(resultData(status).ok, true);
+});
+
 test("authenticated MCP audit records metadata but never tool arguments", async () => {
   const response = await fetch(`${baseUrl}/mcp-audit`, {
     headers: { "x-bridge-secret": SECRET },
@@ -140,6 +167,16 @@ test("authenticated MCP audit records metadata but never tool arguments", async 
   assert.equal(statusCall.completed, true);
   assert.equal(statusCall.response_status, 200);
   assert.match(statusCall.response_content_type, /^text\/event-stream/);
+  const legacyStatusCall = audit.entries.find(
+    (entry) =>
+      entry.transport === "sse" &&
+      entry.requests.some(
+        (request) =>
+          request.method === "tools/call" && request.tool_name === "toy_status",
+      ),
+  );
+  assert.equal(legacyStatusCall.completed, true);
+  assert.equal(legacyStatusCall.response_status, 202);
   assert.equal(JSON.stringify(audit).includes("arguments"), false);
   assert.equal(JSON.stringify(audit).includes(SECRET), false);
 

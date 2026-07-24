@@ -67,7 +67,15 @@ https://你的域名/health
 
 为兼容 Kelivo，设备未就绪、缺少令牌或令牌过期等安全拒绝会作为普通工具文本结果返回，并在结果 JSON 中标记 `"ok": false`；它们不会进入动作队列。这样既保持拒绝动作，又避免客户端丢失 MCP `isError` 后形成没有 `tool_result` 的 Claude 消息。
 
-MCP 的 Streamable HTTP 响应使用规范首选的 SSE 模式。Kelivo 仍可通过同一个 `/mcp` 地址连接、列出及调用工具；SSE 响应可避免部分客户端只在 JSON 调用回包路径上丢失工具结果。
+标准的 `/mcp` Streamable HTTP 端点使用 SSE 格式回包。Kelivo 的已知问题发生在其整个 Streamable HTTP 客户端路径中，单纯切换该端点的回包格式无法绕过，因此 Kelivo 应使用下面独立的旧式 SSE 端点。
+
+Kelivo 当前版本在 `HTTP`（Streamable HTTP）传输下存在已知的工具结果注入问题：服务端调用已经成功并返回 200，但结果可能没有进入下一条模型消息。服务器因此同时提供独立的旧式 SSE 兼容端点。Kelivo 中把传输类型设为 `SSE`，地址填写：
+
+```text
+https://你的域名/sse
+```
+
+自定义请求头仍使用原来的 `Authorization: Bearer <BRIDGE_SECRET>`。`/mcp` 会继续保留给其他标准客户端使用。
 
 如需排查客户端是否实际发送了工具调用，可用 `BRIDGE_SECRET` 请求 `GET /mcp-audit`。该内存审计最多保留最近 30 次 MCP 请求，只记录 JSON-RPC 方法、工具名、完成状态、HTTP 状态码和响应类型，不记录工具参数、动作令牌或认证信息；服务重启后自动清空。
 

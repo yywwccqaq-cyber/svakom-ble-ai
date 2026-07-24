@@ -2,6 +2,7 @@ import { randomUUID, timingSafeEqual } from "node:crypto";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import * as z from "zod/v4";
 
@@ -292,7 +293,7 @@ export class RelayState {
 function createToyMcpServer(state, { maxDurationSeconds }) {
   const server = new McpServer({
     name: "svakom-kelivo-bridge",
-    version: "1.2.3",
+    version: "1.3.0",
   });
 
   const requireReady = () => {
@@ -644,6 +645,7 @@ export function createRelayApp({
   );
   const app = createMcpExpressApp({ host: "0.0.0.0" });
   const mcpAudit = [];
+  const legacySseSessions = new Map();
   let nextAuditSequence = 1;
 
   const requireMcpAuth = (request, response, next) => {
@@ -659,6 +661,41 @@ export function createRelayApp({
       return next();
     }
     return response.status(401).json({ error: "unauthorized" });
+  };
+
+  const recordMcpRequest = (request, response, transport) => {
+    const startedAt = Date.now();
+    const auditEntry = {
+      sequence: nextAuditSequence,
+      received_at: new Date(startedAt).toISOString(),
+      transport,
+      requests: summarizeMcpRequest(request.body),
+      accept: String(request.get("accept") ?? "").slice(0, 160),
+      response_status: null,
+      response_content_type: null,
+      duration_ms: null,
+      completed: false,
+    };
+    nextAuditSequence += 1;
+    mcpAudit.push(auditEntry);
+    if (mcpAudit.length > 30) mcpAudit.shift();
+
+    response.once("finish", () => {
+      auditEntry.response_status = response.statusCode;
+      auditEntry.response_content_type = String(
+        response.getHeader("content-type") ?? "",
+      ).slice(0, 160);
+      auditEntry.duration_ms = Date.now() - startedAt;
+      auditEntry.completed = true;
+    });
+    response.once("close", () => {
+      if (auditEntry.completed) return;
+      auditEntry.response_status = response.statusCode || null;
+      auditEntry.response_content_type = String(
+        response.getHeader("content-type") ?? "",
+      ).slice(0, 160);
+      auditEntry.duration_ms = Date.now() - startedAt;
+    });
   };
 
   app.get("/health", (_request, response) => {
@@ -702,37 +739,7 @@ export function createRelayApp({
   });
 
   app.post("/mcp", requireMcpAuth, async (request, response) => {
-    const startedAt = Date.now();
-    const auditEntry = {
-      sequence: nextAuditSequence,
-      received_at: new Date(startedAt).toISOString(),
-      requests: summarizeMcpRequest(request.body),
-      accept: String(request.get("accept") ?? "").slice(0, 160),
-      response_status: null,
-      response_content_type: null,
-      duration_ms: null,
-      completed: false,
-    };
-    nextAuditSequence += 1;
-    mcpAudit.push(auditEntry);
-    if (mcpAudit.length > 30) mcpAudit.shift();
-
-    response.once("finish", () => {
-      auditEntry.response_status = response.statusCode;
-      auditEntry.response_content_type = String(
-        response.getHeader("content-type") ?? "",
-      ).slice(0, 160);
-      auditEntry.duration_ms = Date.now() - startedAt;
-      auditEntry.completed = true;
-    });
-    response.once("close", () => {
-      if (auditEntry.completed) return;
-      auditEntry.response_status = response.statusCode || null;
-      auditEntry.response_content_type = String(
-        response.getHeader("content-type") ?? "",
-      ).slice(0, 160);
-      auditEntry.duration_ms = Date.now() - startedAt;
-    });
+    recordMcpRequest(request, response, "streamable-http");
 
     const server = createToyMcpServer(state, {
       maxDurationSeconds: maximumDuration,
@@ -761,6 +768,73 @@ export function createRelayApp({
     } finally {
       await transport.close().catch(() => {});
       await server.close().catch(() => {});
+    }
+  });
+
+  // Kelivo has a known result-injection bug in its Streamable HTTP client.
+  // Keep the modern /mcp endpoint, and offer the legacy two-endpoint SSE
+  // transport as a compatibility path until the client bug is fixed.
+  app.get("/sse", requireMcpAuth, async (_request, response) => {
+    const server = createToyMcpServer(state, {
+      maxDurationSeconds: maximumDuration,
+    });
+    const transport = new SSEServerTransport("/messages", response);
+    const sessionId = transport.sessionId;
+    let cleanedUp = false;
+
+    const cleanup = async () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      legacySseSessions.delete(sessionId);
+      await server.close().catch(() => {});
+    };
+
+    legacySseSessions.set(sessionId, { server, transport });
+    response.once("close", () => {
+      void cleanup();
+    });
+
+    try {
+      await server.connect(transport);
+    } catch (error) {
+      legacySseSessions.delete(sessionId);
+      console.error(
+        "Legacy SSE connection failed:",
+        error instanceof Error ? error.message : error,
+      );
+      if (!response.headersSent) {
+        response.status(500).send("Legacy SSE connection failed");
+      }
+      await cleanup();
+    }
+  });
+
+  app.post("/messages", requireMcpAuth, async (request, response) => {
+    recordMcpRequest(request, response, "sse");
+    const sessionId = String(request.query.sessionId ?? "");
+    const session = legacySseSessions.get(sessionId);
+    if (!sessionId) {
+      response.status(400).send("Missing sessionId");
+      return;
+    }
+    if (!session) {
+      response.status(404).send("SSE session not found");
+      return;
+    }
+    try {
+      await session.transport.handlePostMessage(
+        request,
+        response,
+        request.body,
+      );
+    } catch (error) {
+      console.error(
+        "Legacy SSE message failed:",
+        error instanceof Error ? error.message : error,
+      );
+      if (!response.headersSent) {
+        response.status(500).send("Legacy SSE message failed");
+      }
     }
   });
 
