@@ -31,9 +31,10 @@ function bearerToken(request) {
 }
 
 function textResult(message, data = {}, isError = false) {
+  const details =
+    Object.keys(data).length > 0 ? `\n${JSON.stringify(data)}` : "";
   return {
-    content: [{ type: "text", text: message }],
-    structuredContent: data,
+    content: [{ type: "text", text: `${message}${details}` }],
     ...(isError ? { isError: true } : {}),
   };
 }
